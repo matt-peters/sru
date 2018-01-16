@@ -48,7 +48,6 @@ class TestSRU(unittest.TestCase):
             cell.weight.grad.data.numpy(),
             cell_cuda.weight.grad.data.cpu().numpy()
         ))
-
         self.assertTrue(np.allclose(
             cell.bias.grad.data.numpy(),
             cell_cuda.bias.grad.data.cpu().numpy()
