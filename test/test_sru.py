@@ -17,9 +17,10 @@ class TestSRU(unittest.TestCase):
         x_cuda = x.cuda()
 
         cell = SRUCell(nx, nx, dropout=0, rnn_dropout=0,
-                   bidirectional=False, use_tanh=0, use_relu=0)
+                   bidirectional=False, use_tanh=1, use_relu=0, use_proj=True)
         cell_cuda = SRUCell(nx, nx, dropout=0, rnn_dropout=0,
-                   bidirectional=False, use_tanh=0, use_relu=0).cuda()
+                   bidirectional=False, use_tanh=1, use_relu=0).cuda()
+        cell_cuda.set_bias(-1.0)
 
         cell.weight.data.copy_(cell_cuda.weight.clone().data.cpu())
         cell.bias.data.copy_(cell_cuda.bias.clone().data.cpu())

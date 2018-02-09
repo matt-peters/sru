@@ -518,9 +518,88 @@ def SRU_Compute_CPU(activation_type, d, bidirectional=False):
     return sru_compute_cpu
 
 
+def SRU_Compute_CPU_PROJ(activation_type, d, bidirectional=False):
+    """CPU version of the core SRU computation.
+
+    Has the same interface as SRU_Compute_GPU() but is a regular Python function
+    instead of a torch.autograd.Function because we don't implement backward()
+    explicitly.
+    """
+#    assert not bidirectional
+#    from torch.autograd import Variable
+#    u = torch.autograd.Variable(torch.rand(35, 51))
+#    x = torch.autograd.Variable(torch.rand(7, 5, 17))
+#    bias = torch.autograd.Variable(torch.rand(34))
+#    init = None
+#    mask_h = None
+#    activation_type = 1
+#    d = 17
+
+    def sru_compute_cpu(u, x, bias, init=None, mask_h=None):
+        print(u.shape, x.shape, bias.shape)
+        print(d, activation_type)
+        # torch.Size([35, 51]) torch.Size([7, 5, 17]) torch.Size([34])
+        # d = n_out
+
+        # bias = (2 * d, ) vector with [forget_bias; reset_bias]
+        # x = (n_times, batch_size, n_in)
+        # u = (n_times * batch_size, n_out * 3) with [x_tilde; W_f * x; W_r * x]
+        length = x.size(0)
+        batch = x.size(-2)
+        k = 3
+
+        u = u.view(length, batch, d, k)
+
+        x_tilde = u[:, :, :, 0]
+
+        forget_bias, reset_bias = bias.view(2, d)
+        forget = (u[:, :, :, 1] + forget_bias).sigmoid()
+        reset = (u[:, :, :, 2] + reset_bias).sigmoid()
+
+        x_prime = x
+
+        c = Variable(x.data.new(length, batch, d))
+
+        if init is None:
+            c_init = Variable(x.data.new(batch, d).zero_())
+        else:
+            c_init = init.view(batch, d)
+
+        c_prev = c_init
+        for t in range(length):
+            # (batch_size, n_out) for this time step
+            c_t = (c_prev - x_tilde[t, :, :]) * forget[t, :, :] + x_tilde[t, :, :]
+            c_prev = c_t
+            c[t, :, :] = c_t
+        c_final = c_t
+
+        # now apply activation and compute h
+        if activation_type == 0:
+            g_c = c
+        elif activation_type == 1:
+            g_c = c.tanh()
+        elif activation_type == 2:
+            g_c = nn.functional.relu(c)
+        else:
+            assert False, 'Activation type must be 0, 1, or 2, not {}'.format(activation_type)
+
+        # h(t) = activation(c) * mask_h * reset + (1.0 - reset) * x_prime
+        #      = reset * (activation(c) * mask_h - x_prime) + x_prime
+        if mask_h is None:
+            h = (g_c - x_prime) * reset + x_prime
+        else:
+            # mask_h = (batch, n_out)
+            h = (g_c * mask_h.unsqueeze(0) - x_prime) * reset + x_prime
+
+        return h, c_final
+
+    return sru_compute_cpu
+
+
 class SRUCell(nn.Module):
     def __init__(self, n_in, n_out, dropout=0, rnn_dropout=0,
-                bidirectional=False, use_tanh=1, use_relu=0):
+                bidirectional=False, use_tanh=1, use_relu=0,
+                use_proj=False):
         super(SRUCell, self).__init__()
         self.n_in = n_in
         self.n_out = n_out
@@ -528,14 +607,23 @@ class SRUCell(nn.Module):
         self.dropout = dropout
         self.bidirectional = bidirectional
         self.activation_type = 2 if use_relu else (1 if use_tanh else 0)
+        self.use_proj = use_proj
 
         out_size = n_out*2 if bidirectional else n_out
         k = 4 if n_in != out_size else 3
-        self.size_per_dir = n_out*k
-        self.weight = nn.Parameter(torch.Tensor(
-            n_in,
-            self.size_per_dir*2 if bidirectional else self.size_per_dir
-        ))
+        if not use_proj:
+            size_per_dir = n_out*k
+            self.weight = nn.Parameter(torch.Tensor(
+                n_in,
+                size_per_dir*2 if bidirectional else size_per_dir
+            ))
+        else:
+            # TODO
+            size_per_dir = n_out*k
+            self.weight = nn.Parameter(torch.Tensor(
+                n_in,
+                size_per_dir*2 if bidirectional else size_per_dir
+            ))
         self.bias = nn.Parameter(torch.Tensor(
             n_out*4 if bidirectional else n_out*2
         ))
@@ -571,10 +659,13 @@ class SRUCell(nn.Module):
         x_2d = x if x.dim() == 2 else x.contiguous().view(-1, n_in)
         u = x_2d.mm(self.weight)
 
-        if input.is_cuda:
-            SRU_Compute = SRU_Compute_GPU(self.activation_type, n_out, self.bidirectional)
+        if not self.use_proj:
+            if input.is_cuda:
+                SRU_Compute = SRU_Compute_GPU(self.activation_type, n_out, self.bidirectional)
+            else:
+                SRU_Compute = SRU_Compute_CPU(self.activation_type, n_out, self.bidirectional)
         else:
-            SRU_Compute = SRU_Compute_CPU(self.activation_type, n_out, self.bidirectional)
+            SRU_Compute = SRU_Compute_CPU_PROJ(self.activation_type, n_out, self.bidirectional)
 
         if self.training and (self.dropout>0):
             bidir = 2 if self.bidirectional else 1
