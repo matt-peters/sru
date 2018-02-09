@@ -10,6 +10,8 @@ from pynvrtc.compiler import Program
 from collections import namedtuple
 
 
+# TODO: move computation of h outside the CUDA loop so can do the projection all at once...
+
 SRU_CODE = """
 extern "C" {
 
@@ -25,9 +27,10 @@ extern "C" {
 
     __global__ void sru_fwd(const float * __restrict__ u, const float * __restrict__ x,
                             const float * __restrict__ bias, const float * __restrict__ init,
-                            const float * __restrict__ mask_h,
+                            //const float * __restrict__ mask_h,
                             const int len, const int batch, const int d, const int k,
-                            float * __restrict__ h, float * __restrict__ c,
+                            //float * __restrict__ h,
+                            float * __restrict__ c,
                             const int activation_type)
     {
         assert ((k == 3) || (x == NULL));
@@ -40,29 +43,29 @@ extern "C" {
         int ncols_x = (k == 3) ? ncols : ncols_u;
 
         const float bias1 = *(bias + (col%d));
-        const float bias2 = *(bias + (col%d) + d);
-        const float mask = (mask_h == NULL) ? 1.0 : (*(mask_h + col));
+        //const float bias2 = *(bias + (col%d) + d);
+        //const float mask = (mask_h == NULL) ? 1.0 : (*(mask_h + col));
         float cur = *(init + col);
 
         const float *up = u + (col*k);
         const float *xp = (k == 3) ? (x + col) : (up + 3);
         float *cp = c + col;
-        float *hp = h + col;
+        //float *hp = h + col;
 
         for (int row = 0; row < len; ++row)
         {
             float g1 = sigmoidf((*(up+1))+bias1);
-            float g2 = sigmoidf((*(up+2))+bias2);
+            //float g2 = sigmoidf((*(up+2))+bias2);
             cur = (cur-(*up))*g1 + (*up);
             *cp = cur;
-            float val = (activation_type == 1) ? tanh(cur) : (
-                (activation_type == 2) ? reluf(cur) : cur
-            );
-            *hp = (val*mask-(*xp))*g2 + (*xp);
+            //float val = (activation_type == 1) ? tanh(cur) : (
+            //    (activation_type == 2) ? reluf(cur) : cur
+            //);
+            //*hp = (val*mask-(*xp))*g2 + (*xp);
             up += ncols_u;
             xp += ncols_x;
             cp += ncols;
-            hp += ncols;
+            //hp += ncols;
         }
     }
 
@@ -379,12 +382,12 @@ class SRU_Compute_GPU(Function):
             x.contiguous().data_ptr() if k_ == 3 else 0,
             bias.data_ptr(),
             init_.contiguous().data_ptr(),
-            mask_h.data_ptr() if mask_h is not None else 0,
+            #mask_h.data_ptr() if mask_h is not None else 0,
             length,
             batch,
             d,
             k_,
-            h.data_ptr(),
+            #h.data_ptr(),
             c.data_ptr(),
             self.activation_type],
             block = (thread_per_block,1,1), grid = (num_block,1,1),
@@ -452,7 +455,7 @@ class SRU_Compute_GPU(Function):
         return grad_u, grad_x, grad_bias.sum(1).view(-1), grad_init, None
 
 
-def SRU_Compute_CPU(activation_type, d, bidirectional=False):
+def SRU_Compute_CPU(activation_type, d, bidirectional=False, n_c=None):
     """CPU version of the core SRU computation.
 
     Has the same interface as SRU_Compute_GPU() but is a regular Python function
@@ -463,25 +466,31 @@ def SRU_Compute_CPU(activation_type, d, bidirectional=False):
         bidir = 2 if bidirectional else 1
         length = x.size(0) if x.dim() == 3 else 1
         batch = x.size(-2)
-        k = u.size(-1) // d // bidir
-
         if mask_h is None:
-            mask_h = 1
+            mask_h = Variable(x.data.new(batch, d*bidir).fill_(1.0))
 
-        u = u.view(length, batch, bidir, d, k)
+        if n_c is None:
+            k = u.size(-1) // d // bidir
 
-        x_tilde = u[..., 0]
+            u = u.view(length, batch, bidir, d, k)
 
-        forget_bias, reset_bias = bias.view(2, bidir, d)
-        forget = (u[..., 1] + forget_bias).sigmoid()
-        reset = (u[..., 2] + reset_bias).sigmoid()
+            x_tilde = u[..., 0]
 
-        if k == 3:
-            x_prime = x.view(length, batch, bidir, d)
+            forget_bias, reset_bias = bias.view(2, bidir, d)
+            forget = (u[..., 1] + forget_bias).sigmoid()
+            reset = (u[..., 2] + reset_bias).sigmoid()
+
+            if k == 3:
+                x_prime = x.view(length, batch, bidir, d)
+            else:
+                x_prime = u[..., 3]
         else:
-            x_prime = u[..., 3]
+            x_tilde = u[:, :, :n_c].unsqueeze(-2)
+            forget = (u[:, :, n_c:(2 * n_c)] + bias[:n_c]).sigmoid().unsqueeze(-2)
+            reset = (u[:, :, (2 * n_c):] + bias[n_c:]).sigmoid().unsqueeze(-2)
+            x_prime = x.view(length, batch, bidir, d)
 
-        h = Variable(x.data.new(length, batch, bidir, d))
+        c = Variable(x.data.new(length, batch, bidir, d))
 
         if init is None:
             c_init = Variable(x.data.new(batch, bidir, d).zero_())
@@ -499,19 +508,21 @@ def SRU_Compute_CPU(activation_type, d, bidirectional=False):
             for t in time_seq:
                 c_t = (c_prev - x_tilde[t, :, di, :]) * forget[t, :, di, :] + x_tilde[t, :, di, :]
                 c_prev = c_t
-
-                if activation_type == 0:
-                    g_c_t = c_t
-                elif activation_type == 1:
-                    g_c_t = c_t.tanh()
-                elif activation_type == 2:
-                    g_c_t = nn.functional.relu(c_t)
-                else:
-                    assert False, 'Activation type must be 0, 1, or 2, not {}'.format(activation_type)
-
-                h[t, :, di, :] = (g_c_t * mask_h - x_prime[t, :, di, :]) * reset[t, :, di, :] + x_prime[t, :, di, :]
+                c[t, :, di, :] = c_t
 
             c_final.append(c_t)
+
+        if activation_type == 0:
+            g_c = c
+        elif activation_type == 1:
+            g_c = c.tanh()
+        elif activation_type == 2:
+            g_c = nn.functional.relu(c)
+        else:
+            assert False, 'Activation type must be 0, 1, or 2, not {}'.format(activation_type)
+
+        # TODO: if projection, then apply it here to g_c
+        h = (g_c * mask_h.unsqueeze(0).unsqueeze(-2) - x_prime) * reset + x_prime
 
         return h.view(length, batch, -1), torch.stack(c_final, dim=1).view(batch, -1)
 
@@ -520,38 +531,82 @@ def SRU_Compute_CPU(activation_type, d, bidirectional=False):
 
 class SRUCell(nn.Module):
     def __init__(self, n_in, n_out, dropout=0, rnn_dropout=0,
-                bidirectional=False, use_tanh=1, use_relu=0):
+                bidirectional=False, use_tanh=1, use_relu=0,
+                n_c=None):
+        # if n_c is not None, then it is the dimension of c, and we add a projection layer
+        # in this case, assume n_in == n_out for simplicity
+
+        #Without proj:
+        #(1) xtilde = W * x               (n_out)
+        #(2) ft = sigmoid(Wf * xt + bf)   (n_out)
+        #(3) rt = sigmoid(Wr * xt + br)   (n_out)
+        #(4) ct = ft * c_{t-1} + (1-ft) * xtilde  (n_out)
+        #(5) ht = rt * g(ct) + (1-rt) * xt   (n_out)
+
         super(SRUCell, self).__init__()
         self.n_in = n_in
         self.n_out = n_out
         self.rnn_dropout = rnn_dropout
         self.dropout = dropout
+        assert dropout == 0
         self.bidirectional = bidirectional
+        assert not self.bidirectional
         self.activation_type = 2 if use_relu else (1 if use_tanh else 0)
 
-        out_size = n_out*2 if bidirectional else n_out
-        k = 4 if n_in != out_size else 3
-        self.size_per_dir = n_out*k
-        self.weight = nn.Parameter(torch.Tensor(
-            n_in,
-            self.size_per_dir*2 if bidirectional else self.size_per_dir
-        ))
-        self.bias = nn.Parameter(torch.Tensor(
-            n_out*4 if bidirectional else n_out*2
-        ))
+        if self.activation_type == 0:
+            self.activation = lambda x: x
+        elif self.activation_type == 1:
+            self.activation = torch.nn.functional.tanh
+        elif self.activation_type == 2:
+            self.activation = nn.functional.relu
+
+        if n_c is not None:
+            assert n_c > n_out
+            assert not bidirectional
+            assert n_out == n_in
+        self.n_c = n_c
+
+        if n_c is None:
+            out_size = n_out*2 if bidirectional else n_out
+            # k = the number of gates to use
+            k = 4 if n_in != out_size else 3
+            assert k == 3
+            size_per_dir = n_out*k
+            self.weight = nn.Parameter(torch.Tensor(
+                n_in,
+                size_per_dir*2 if bidirectional else size_per_dir
+            ))
+            self.bias = nn.Parameter(torch.Tensor(
+                n_out*4 if bidirectional else n_out*2
+            ))
+
+        else:
+            # first gate has size n_c, second gate has size n_c, third has size n_out
+            n_gates = 2 * n_c + n_out
+            self.weight = nn.Parameter(torch.Tensor(
+                n_in, n_gates
+            ))
+            # two biases: n_c and n_out (forget gate then highway gate)
+            self.bias = nn.Parameter(torch.Tensor(n_c + n_out))
+            self.weight_proj = nn.Parameter(torch.Tensor(n_c, n_out))
+
         self.init_weight()
 
     def init_weight(self):
         val_range = (3.0/self.n_in)**0.5
         self.weight.data.uniform_(-val_range, val_range)
         self.bias.data.zero_()
+        if self.n_c is not None:
+            self.weight_proj.data.uniform_((1.0 / self.n_c) ** 0.5)
 
     def set_bias(self, bias_val=0):
         n_out = self.n_out
         if self.bidirectional:
             self.bias.data[n_out*2:].zero_().add_(bias_val)
-        else:
+        elif self.n_c is None:
             self.bias.data[n_out:].zero_().add_(bias_val)
+        else:
+            self.bias.data[self.n_c:].zero_().add_(bias_val)
 
     def forward(self, input, c0=None):
         assert input.dim() == 2 or input.dim() == 3
@@ -571,17 +626,40 @@ class SRUCell(nn.Module):
         x_2d = x if x.dim() == 2 else x.contiguous().view(-1, n_in)
         u = x_2d.mm(self.weight)
 
+        print("----", u.shape)
         if input.is_cuda:
             SRU_Compute = SRU_Compute_GPU(self.activation_type, n_out, self.bidirectional)
         else:
-            SRU_Compute = SRU_Compute_CPU(self.activation_type, n_out, self.bidirectional)
+            SRU_Compute = SRU_Compute_CPU(self.activation_type, n_out, self.bidirectional, self.n_c)
 
+        bidir = 2 if self.bidirectional else 1
         if self.training and (self.dropout>0):
-            bidir = 2 if self.bidirectional else 1
             mask_h = self.get_dropout_mask_((batch, n_out*bidir), self.dropout)
-            return SRU_Compute(u, input, self.bias, c0, mask_h)
+            ret = SRU_Compute(u, input, self.bias, c0, mask_h)
         else:
-            return SRU_Compute(u, input, self.bias, c0)
+            ret = SRU_Compute(u, input, self.bias, c0)
+
+        if not input.is_cuda:
+            return ret
+    
+        # else using cuda
+        # ret = c, last_hidden
+        # need to return h, last_hidden
+        # ht = rt * g(ct) + (1-rt) * xt
+        length = input.size(0) if input.dim() == 3 else 1
+        batch = input.size(-2)
+        d = self.n_out
+        k = u.size(-1) // d // bidir
+        # assumes self.bidirectional = false
+        u = u.view(length, batch, d, k)
+        forget_bias, reset_bias = self.bias.view(2, bidir, d)
+        rt = (u[:, :, :, 2] + reset_bias).sigmoid()
+        print(rt.shape, ret[0].shape, input.shape)
+        # TODO: ignore mask_h for now
+        ht = rt * self.activation(ret[0]) + (1.0 - rt) * input
+
+        return ht, ret[1]
+
 
     def get_dropout_mask_(self, size, p):
         w = self.weight.data
