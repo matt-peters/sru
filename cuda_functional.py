@@ -66,6 +66,38 @@ extern "C" {
         }
     }
 
+    __global__ void sru_fwd_proj(const float * __restrict__ u,
+                            const float * __restrict__ bias, const float * __restrict__ init,
+                            const int len, const int batch, const int d,
+                            float * __restrict__ c)
+    {
+        int ncols = batch*d;
+        int col = blockIdx.x * blockDim.x + threadIdx.x;
+        if (col >= ncols) return;
+
+        int ncols_u = ncols*2;
+
+        const float bias1 = *(bias + (col%d));
+        if ((col%d == 0) || (col%d == 1)) {
+            printf("asdf %d %d %f", col, col%d, bias1);
+        }
+
+        float cur = *(init + col);
+
+        const float *up = u + (col*2);
+        float *cp = c + col;
+
+        for (int row = 0; row < len; ++row)
+        {
+            float g1 = sigmoidf((*(up+1))+bias1);
+            cur = (cur-(*up))*g1 + (*up);
+            *cp = cur;
+            up += ncols_u;
+            cp += ncols;
+        }
+    }
+
+
     __global__ void sru_bwd(const float * __restrict__ u, const float * __restrict__ x,
                             const float * __restrict__ bias, const float * __restrict__ init,
                             const float * __restrict__ mask_h, const float * __restrict__ c,
@@ -452,6 +484,172 @@ class SRU_Compute_GPU(Function):
         return grad_u, grad_x, grad_bias.sum(1).view(-1), grad_init, None
 
 
+class SRU_Compute_GPU_PROJ(torch.nn.Module):
+    def __init__(self, activation_type, d_out):
+        super(SRU_Compute_GPU_PROJ, self).__init__()
+        self._inner = SRU_Compute_GPU_INNER(d_out)
+        self.d_out = d_out
+        if activation_type == 0:
+            self.activation = lambda x: x
+        elif activation_type == 1:
+            self.activation = torch.nn.functional.tanh
+        elif activation_type == 2:
+            self.activation = torch.nn.functional.relu
+        else:
+            assert False, 'Activation type must be 0, 1, or 2, not {}'.format(activation_type)
+
+    def forward(self, u, x, bias, init=None, mask_h=None):
+        print("GPU PROJ")
+        print("GPU PROJ")
+        # call the inner function to compute c
+        length = x.size(0)
+        batch = x.size(1)
+
+        uu = u.view(length, batch, self.d_out, 3)
+        u_without_reset = uu[:, :, :, 0:2].contiguous().view(length * batch,
+                                                             self.d_out * 2)
+
+        forget_bias, reset_bias = bias.view(2, self.d_out)
+        reset = (uu[:, :, :, 2] + reset_bias).sigmoid().view(
+                                        length, batch, self.d_out)
+
+        init_ = x.new(batch, self.d_out).zero_() if init is None else init
+
+        c, c_last = self._inner(u_without_reset, forget_bias, init_)
+        print("asdf")
+        print(c[-1, :, :])
+        print("aaa")
+
+        # now apply activation and compute h
+        # h(t) = activation(c) * mask_h * reset + (1.0 - reset) * x_prime
+        #      = reset * (activation(c) * mask_h - x_prime) + x_prime
+        g_c = self.activation(c)
+        if mask_h is None:
+            h = (g_c - x) * reset + x
+        else:
+            # mask_h = (batch, n_out)
+            h = (g_c * mask_h.unsqueeze(0) - x) * reset + x
+
+        return h, c_last
+
+
+class SRU_Compute_GPU_INNER(Function):
+    _FWD_FUNC = None
+    _BWD_FUNC = None
+    _STREAM = None
+
+    def __init__(self, d_out):
+        self.compile()
+        super(SRU_Compute_GPU_INNER, self).__init__()
+        self.d_out = d_out
+
+    @classmethod
+    def compile(cls):
+        """Compiles forward and backward GPU kernels for uni- and bi-directional
+        SRU. Assumes there is only one GPU.
+        """
+        if cls._STREAM is not None:
+            return
+
+        prog = Program(SRU_CODE.encode(), 'sru_prog.cu'.encode())
+        ptx = prog.compile()
+        mod = function.Module()
+        mod.load(bytes(ptx.encode()))
+        cls._FWD_FUNC = mod.get_function('sru_fwd_proj')
+        cls._BWD_FUNC = mod.get_function('sru_bwd')
+
+        Stream = namedtuple('Stream', ['ptr'])
+        cls._STREAM = Stream(ptr=torch.cuda.current_stream().cuda_stream)
+
+    def forward(self, u, bias, init):
+        batch = init.size(0)
+        length = u.size(0) // batch
+        d = self.d_out
+        ncols = batch*d
+        thread_per_block = min(512, ncols)
+        num_block = (ncols-1)//thread_per_block+1
+
+        size = (length, batch, d)
+
+        c = u.new(*size)
+
+        print("THREAD_PER_BLOCK=%s, NUM_BLOCK=%s" % (thread_per_block, num_block))
+
+        FUNC = self._FWD_FUNC
+        FUNC(args=[
+            u.contiguous().data_ptr(),
+            bias.data_ptr(),
+            init.contiguous().data_ptr(),
+            length,
+            batch,
+            d,
+            c.data_ptr()],
+            block = (thread_per_block,1,1), grid = (num_block,1,1),
+            stream=self._STREAM
+        )
+
+        self.save_for_backward(u, bias, init)
+        self.intermediate = c
+        last_hidden = c[-1, :, :]
+
+        return c, last_hidden
+
+    def backward(self, grad_h, grad_last):
+        bidir = 2 if self.bidirectional else 1
+        u, x, bias, init, mask_h = self.saved_tensors
+        c = self.intermediate
+        length = x.size(0) if x.dim() == 3 else 1
+        batch = x.size(-2)
+        d = self.d_out
+        k = u.size(-1) // d
+        k_ = k//2 if self.bidirectional else k
+        ncols = batch*d*bidir
+        thread_per_block = min(512, ncols)
+        num_block = (ncols-1)//thread_per_block+1
+
+        init_ = x.new(ncols).zero_() if init is None else init
+        grad_u = u.new(*u.size())
+        grad_bias = x.new(2, batch, d*bidir)
+        grad_init = x.new(batch, d*bidir)
+
+        # For DEBUG
+        #size = (length, batch, x.size(-1)) if x.dim() == 3 else (batch, x.size(-1))
+        #grad_x = x.new(*x.size()) if k_ == 3 else x.new(*size).zero_()
+
+        # Normal use
+        grad_x = x.new(*x.size()) if k_ == 3 else None
+
+        FUNC = self._BWD_FUNC if not self.bidirectional else self._BiBWD_FUNC
+        FUNC(args=[
+            u.contiguous().data_ptr(),
+            x.contiguous().data_ptr() if k_ == 3 else 0,
+            bias.data_ptr(),
+            init_.contiguous().data_ptr(),
+            mask_h.data_ptr() if mask_h is not None else 0,
+            c.data_ptr(),
+            grad_h.contiguous().data_ptr(),
+            grad_last.contiguous().data_ptr(),
+            length,
+            batch,
+            d,
+            k_,
+            grad_u.data_ptr(),
+            grad_x.data_ptr() if k_ == 3 else 0,
+            grad_bias.data_ptr(),
+            grad_init.data_ptr(),
+            self.activation_type],
+            block = (thread_per_block,1,1), grid = (num_block,1,1),
+            stream=self._STREAM
+        )
+        return grad_u, grad_x, grad_bias.sum(1).view(-1), grad_init, None
+
+
+
+
+
+
+
+
 def SRU_Compute_CPU(activation_type, d, bidirectional=False):
     """CPU version of the core SRU computation.
 
@@ -572,6 +770,9 @@ def SRU_Compute_CPU_PROJ(activation_type, d, bidirectional=False):
             c_prev = c_t
             c[t, :, :] = c_t
         c_final = c_t
+        print("yo!")
+        print(c[-1, :, :])
+        print("yoyo")
 
         # now apply activation and compute h
         if activation_type == 0:
@@ -665,7 +866,10 @@ class SRUCell(nn.Module):
             else:
                 SRU_Compute = SRU_Compute_CPU(self.activation_type, n_out, self.bidirectional)
         else:
-            SRU_Compute = SRU_Compute_CPU_PROJ(self.activation_type, n_out, self.bidirectional)
+            if input.is_cuda:
+                SRU_Compute = SRU_Compute_GPU_PROJ(self.activation_type, n_out)
+            else:
+                SRU_Compute = SRU_Compute_CPU_PROJ(self.activation_type, n_out, self.bidirectional)
 
         if self.training and (self.dropout>0):
             bidir = 2 if self.bidirectional else 1

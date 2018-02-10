@@ -19,8 +19,12 @@ class TestSRU(unittest.TestCase):
         cell = SRUCell(nx, nx, dropout=0, rnn_dropout=0,
                    bidirectional=False, use_tanh=1, use_relu=0, use_proj=True)
         cell_cuda = SRUCell(nx, nx, dropout=0, rnn_dropout=0,
-                   bidirectional=False, use_tanh=1, use_relu=0).cuda()
-        cell_cuda.set_bias(-1.0)
+                   bidirectional=False, use_tanh=1, use_relu=0, use_proj=True).cuda()
+        cell_cuda.weight.data.normal_(0, std=1)
+        cell_cuda.bias.data.normal_(0, std=1)
+        print("BIAS")
+        print(cell_cuda.bias[:5])
+        print("BIAS")
 
         cell.weight.data.copy_(cell_cuda.weight.clone().data.cpu())
         cell.bias.data.copy_(cell_cuda.bias.clone().data.cpu())
@@ -37,9 +41,10 @@ class TestSRU(unittest.TestCase):
         cell_cuda.zero_grad()
         out_gpu = cell_cuda(x_cuda, c0)
         loss_gpu = (out_gpu[0] * out_gpu[0]).sum()
-        loss_gpu.backward()
+        #loss_gpu.backward()
 
         # check that losses are the same
+        print(loss.data.numpy(), loss_gpu.data.cpu().numpy())
         self.assertTrue(np.allclose(
             loss.data.numpy(), loss_gpu.data.cpu().numpy()
         ))
